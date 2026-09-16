@@ -276,6 +276,7 @@ if not IS_TRACING_SDK_ONLY:
         search_registered_models,
         set_model_version_tag,
         set_prompt_alias,
+        set_registered_model_tag,
     )
     from mlflow.tracking._workspace.fluent import (
         create_workspace,
@@ -417,6 +418,7 @@ if not IS_TRACING_SDK_ONLY:
         "set_experiment_tags",
         "delete_experiment_tag",
         "set_model_version_tag",
+        "set_registered_model_tag",
         "set_registry_uri",
         "set_system_metrics_node_id",
         "set_system_metrics_samples_before_logging",

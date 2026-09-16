@@ -565,6 +565,26 @@ def search_model_versions(
     )
 
 
+def set_registered_model_tag(
+    name: str,
+    key: str | None = None,
+    value: Any = None,
+) -> None:
+    """
+    Set a tag for the registered model.
+
+    Args:
+        name: Registered model name.
+        key: Tag key to log. key is required.
+        value: Tag value to log. value is required.
+    """
+    return MlflowClient().set_registered_model_tag(
+        name=name,
+        key=key,
+        value=value,
+    )
+
+
 def set_model_version_tag(
     name: str,
     version: str | None = None,

@@ -209,6 +209,24 @@ def test_register_model_skips_logged_model_tag_when_not_found(monkeypatch):
     mlflow.set_registry_uri(orig_registry_uri)
 
 
+def test_set_registered_model_tag():
+    class TestModel(mlflow.pyfunc.PythonModel):
+        def predict(self, model_input):
+            return model_input
+
+    mlflow.pyfunc.log_model(name="model", python_model=TestModel(), registered_model_name="Model 1")
+
+    rm = MlflowClient().get_registered_model("Model 1")
+    assert rm.tags == {}
+    mlflow.set_registered_model_tag(
+        name="Model 1",
+        key="key",
+        value="value",
+    )
+    rm = MlflowClient().get_registered_model("Model 1")
+    assert rm.tags == {"key": "value"}
+
+
 def test_set_model_version_tag():
     class TestModel(mlflow.pyfunc.PythonModel):
         def predict(self, model_input):
