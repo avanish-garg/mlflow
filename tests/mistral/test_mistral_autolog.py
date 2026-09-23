@@ -1,3 +1,4 @@
+import re
 from unittest.mock import patch
 
 import httpx
@@ -315,3 +316,71 @@ async def test_chat_complete_async_autolog():
         TokenUsageKey.OUTPUT_TOKENS: 18,
         TokenUsageKey.TOTAL_TOKENS: 28,
     }
+
+
+def test_tracing_headers_injected():
+    with patch(
+        CHAT_DO_REQUEST_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
+    ):
+        mlflow.mistral.autolog()
+        client = Mistral(api_key="test_key")
+        client.chat.complete(**DUMMY_CHAT_COMPLETION_REQUEST)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    span_ctx = span._span.get_span_context()
+    expected_trace_id = format(span_ctx.trace_id, "032x")
+    expected_span_id = format(span_ctx.span_id, "016x")
+
+    from mlflow.tracing.distributed import _get_tracing_headers_from_span
+
+    headers = _get_tracing_headers_from_span(span)
+    assert "traceparent" in headers
+    traceparent = headers["traceparent"]
+    assert re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", traceparent)
+    assert traceparent.startswith(f"00-{expected_trace_id}-{expected_span_id}-")
+
+
+@pytest.mark.asyncio
+async def test_tracing_headers_injected_async():
+    with patch(
+        CHAT_DO_REQUEST_ASYNC_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
+    ):
+        mlflow.mistral.autolog()
+        client = Mistral(api_key="test_key")
+        await client.chat.complete_async(**DUMMY_CHAT_COMPLETION_REQUEST)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    span_ctx = span._span.get_span_context()
+    expected_trace_id = format(span_ctx.trace_id, "032x")
+    expected_span_id = format(span_ctx.span_id, "016x")
+
+    from mlflow.tracing.distributed import _get_tracing_headers_from_span
+
+    headers = _get_tracing_headers_from_span(span)
+    assert "traceparent" in headers
+    traceparent = headers["traceparent"]
+    assert re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", traceparent)
+    assert traceparent.startswith(f"00-{expected_trace_id}-{expected_span_id}-")
+
+
+def test_tracing_headers_preserve_user_http_headers():
+    request = {**DUMMY_CHAT_COMPLETION_REQUEST, "http_headers": {"X-Custom": "my-value"}}
+    with patch(
+        CHAT_DO_REQUEST_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
+    ):
+        mlflow.mistral.autolog()
+        client = Mistral(api_key="test_key")
+        client.chat.complete(**request)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    # User-provided http_headers should be recorded in span inputs and take precedence
+    assert span.inputs.get("http_headers", {}).get("X-Custom") == "my-value"

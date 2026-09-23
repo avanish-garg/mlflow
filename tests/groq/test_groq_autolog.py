@@ -1,4 +1,5 @@
 import json
+import re
 from unittest.mock import patch
 
 import groq
@@ -369,3 +370,41 @@ def test_audio_translation_autolog():
     # No new trace should be created
     traces = get_traces()
     assert len(traces) == 1
+
+
+def test_tracing_headers_injected():
+    mlflow.groq.autolog()
+    client = groq.Groq()
+
+    with patch("groq._client.Groq.post", return_value=DUMMY_CHAT_COMPLETION_RESPONSE):
+        client.chat.completions.create(**DUMMY_CHAT_COMPLETION_REQUEST)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    span_ctx = span._span.get_span_context()
+    expected_trace_id = format(span_ctx.trace_id, "032x")
+    expected_span_id = format(span_ctx.span_id, "016x")
+
+    from mlflow.tracing.distributed import _get_tracing_headers_from_span
+
+    headers = _get_tracing_headers_from_span(span)
+    assert "traceparent" in headers
+    traceparent = headers["traceparent"]
+    assert re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", traceparent)
+    assert traceparent.startswith(f"00-{expected_trace_id}-{expected_span_id}-")
+
+
+def test_tracing_headers_preserve_user_extra_headers():
+    mlflow.groq.autolog()
+    client = groq.Groq()
+
+    request = {**DUMMY_CHAT_COMPLETION_REQUEST, "extra_headers": {"X-Custom": "my-value"}}
+    with patch("groq._client.Groq.post", return_value=DUMMY_CHAT_COMPLETION_RESPONSE):
+        client.chat.completions.create(**request)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    # User-provided extra_headers should be recorded in span inputs and take precedence
+    assert span.inputs.get("extra_headers", {}).get("X-Custom") == "my-value"

@@ -3,7 +3,9 @@ from typing import Any
 
 import mlflow
 from mlflow.entities import SpanType
+from mlflow.entities.span import LiveSpan
 from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
+from mlflow.tracing.distributed import _get_tracing_headers_from_span
 from mlflow.tracing.utils import set_span_chat_tools
 from mlflow.utils.autologging_utils.config import AutoLoggingConfig
 
@@ -47,6 +49,8 @@ def patched_call(original, self, *args, **kwargs):
                 except Exception:
                     _logger.debug(f"Failed to set tools for {span}.", exc_info=True)
 
+            _inject_tracing_headers(kwargs, span)
+
             outputs = original(self, *args, **kwargs)
             span.set_outputs(outputs)
 
@@ -54,6 +58,17 @@ def patched_call(original, self, *args, **kwargs):
                 span.set_attribute(SpanAttributeKey.CHAT_USAGE, usage)
 
             return outputs
+
+
+def _inject_tracing_headers(kwargs: dict[str, Any], span: LiveSpan | None):
+    if span is None:
+        return
+    try:
+        if tracing_headers := _get_tracing_headers_from_span(span):
+            existing = kwargs.get("extra_headers") or {}
+            kwargs["extra_headers"] = tracing_headers | existing
+    except Exception:
+        _logger.debug("Failed to inject tracing headers", exc_info=True)
 
 
 def _parse_usage(output: Any) -> dict[str, int] | None:

@@ -938,6 +938,19 @@ _VALIDATION_EXEMPT_ARGUMENTS = [
     ValidationExemptArgument(
         "anthropic", "create", lambda x: isinstance(x, (dict, type(None))), None, "extra_headers"
     ),
+    ValidationExemptArgument(
+        "mistral", "complete", lambda x: isinstance(x, (dict, type(None))), None, "http_headers"
+    ),
+    ValidationExemptArgument(
+        "mistral",
+        "complete_async",
+        lambda x: isinstance(x, (dict, type(None))),
+        None,
+        "http_headers",
+    ),
+    ValidationExemptArgument(
+        "groq", "create", lambda x: isinstance(x, (dict, type(None))), None, "extra_headers"
+    ),
     # Gemini header injection goes through config.http_options.headers. Config can be
     # None, a dict, or a Pydantic-style object with an http_options attribute.
     ValidationExemptArgument(
