@@ -688,3 +688,96 @@ def test_delete_artifacts_folder_with_nested_folders_and_files(mock_client):
     mock_client.get_container_client().delete_blob.assert_any_call(blob_props_1.name)
     mock_client.get_container_client().delete_blob.assert_any_call(blob_props_2.name)
     mock_client.get_container_client().delete_blob.assert_any_call(blob_props_3.name)
+
+
+def test_create_presigned_upload_url_with_account_key(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.url = "some-url"
+    mock_client.account_name = "some-account"
+    account_key = base64.b64encode(b"some-key").decode("utf-8")
+    mock_client.credential.account_key = account_key
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas") as generate_sas:
+        response = repo.create_presigned_upload_url("model.pkl")
+
+    assert response.presigned_url == "some-url/container/some/path/model.pkl?sas"
+    assert response.headers["x-ms-blob-type"] == "BlockBlob"
+    # .pkl has no standard MIME type, so it should fall back to application/octet-stream
+    assert response.headers["Content-Type"] == "application/octet-stream"
+    kwargs = generate_sas.call_args.kwargs
+    assert kwargs["account_key"] == account_key
+    assert kwargs["permission"].write is True
+    mock_client.get_user_delegation_key.assert_not_called()
+
+
+def test_create_presigned_upload_url_with_known_content_type(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.url = "some-url"
+    mock_client.account_name = "some-account"
+    mock_client.credential.account_key = "key"
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas"):
+        response = repo.create_presigned_upload_url("data.json")
+
+    assert response.headers["Content-Type"] == "application/json"
+
+
+def test_create_presigned_upload_url_with_token_credential(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.url = "some-url"
+    mock_client.account_name = "some-account"
+    mock_client.credential = mock.Mock(spec=["get_token"])
+    user_delegation_key = mock_client.get_user_delegation_key.return_value
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas") as generate_sas:
+        repo.create_presigned_upload_url("model.pkl")
+
+    kwargs = generate_sas.call_args.kwargs
+    assert kwargs["user_delegation_key"] is user_delegation_key
+    assert "account_key" not in kwargs
+    assert kwargs["start"].tzinfo is not None
+    assert kwargs["start"] < kwargs["expiry"]
+
+
+def test_create_presigned_upload_url_falls_back_when_delegation_key_is_forbidden(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.credential = mock.Mock(spec=["get_token"])
+    error = HttpResponseError(response=mock.Mock(status_code=403))
+    error.error_code = "AuthorizationPermissionMismatch"
+    mock_client.get_user_delegation_key.side_effect = error
+
+    with pytest.raises(
+        _UnsupportedMultipartUploadException,
+        match=_UnsupportedMultipartUploadException.MESSAGE,
+    ):
+        repo.create_presigned_upload_url("model.pkl")
+
+
+def test_get_download_presigned_url_with_account_key(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.account_name = "some-account"
+    mock_client.credential.account_key = "key"
+    blob_client = mock_client.get_blob_client.return_value
+    blob_client.url = "some-url/container/some/path/model.pkl"
+    blob_client.get_blob_properties.return_value.size = 123
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas") as generate_sas:
+        response = repo.get_download_presigned_url("model.pkl")
+
+    mock_client.get_blob_client.assert_called_once_with("container", "some/path/model.pkl")
+    assert response.url == "some-url/container/some/path/model.pkl?sas"
+    assert response.headers == {}
+    assert response.file_size == 123
+    kwargs = generate_sas.call_args.kwargs
+    assert kwargs["permission"].read is True
+    assert 'filename="model.pkl"' in kwargs["content_disposition"]
+
+
+def test_get_download_presigned_url_missing_blob_raises(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.get_blob_client.return_value.get_blob_properties.side_effect = (
+        ResourceNotFoundError("not found")
+    )
+
+    with pytest.raises(MlflowException, match="No such file or directory"):
+        repo.get_download_presigned_url("missing.pkl")

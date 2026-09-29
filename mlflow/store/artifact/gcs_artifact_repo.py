@@ -2,6 +2,7 @@ import datetime
 import os
 import posixpath
 import urllib.parse
+from mimetypes import guess_type
 from typing import Any, NamedTuple
 
 from packaging.version import Version
@@ -11,18 +12,24 @@ from mlflow.entities.multipart_upload import (
     CreateMultipartUploadResponse,
     MultipartUploadCredential,
 )
+from mlflow.entities.presigned_download import PresignedDownloadUrlResponse
+from mlflow.entities.presigned_upload import CreatePresignedUploadResponse
 from mlflow.environment_variables import (
     MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT,
     MLFLOW_GCS_DOWNLOAD_CHUNK_SIZE,
     MLFLOW_GCS_UPLOAD_CHUNK_SIZE,
 )
-from mlflow.exceptions import _UnsupportedMultipartUploadException
+from mlflow.exceptions import MlflowException, _UnsupportedMultipartUploadException
+from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 from mlflow.store.artifact.artifact_repo import (
     ArtifactRepository,
+    MultipartDownloadMixin,
     MultipartUploadMixin,
+    PresignedUploadMixin,
     _is_object_key_within_path,
     _retry_with_new_creds,
 )
+from mlflow.store.artifact.s3_artifact_repo import _attachment_content_disposition
 from mlflow.utils import get_installed_version
 from mlflow.utils.file_utils import relative_path_to_artifact_path
 
@@ -34,7 +41,9 @@ class GCSMPUArguments(NamedTuple):
     content_type: str
 
 
-class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
+class GCSArtifactRepository(
+    ArtifactRepository, MultipartUploadMixin, MultipartDownloadMixin, PresignedUploadMixin
+):
     """
     Stores artifacts on Google Cloud Storage.
 
@@ -192,6 +201,54 @@ class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         for blob in blobs:
             if _is_object_key_within_path(blob.name, dest_path):
                 blob.delete()
+
+    def create_presigned_upload_url(self, artifact_path, expiration=900):
+        """Generate a presigned URL for uploading an artifact directly to GCS."""
+        (bucket, dest_path) = self.parse_gcs_uri(self.artifact_uri)
+        dest_path = posixpath.join(dest_path, artifact_path)
+
+        content_type, _ = guess_type(artifact_path)
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        gcs_bucket = self._get_bucket(bucket)
+        blob = gcs_bucket.blob(dest_path)
+        presigned_url = blob.generate_signed_url(
+            method="PUT",
+            version="v4",
+            expiration=datetime.timedelta(seconds=expiration),
+            content_type=content_type,
+        )
+        return CreatePresignedUploadResponse(
+            presigned_url=presigned_url,
+            headers={"Content-Type": content_type},
+        )
+
+    def get_download_presigned_url(self, artifact_path, expiration=300):
+        """Generate a presigned URL for downloading an artifact directly from GCS."""
+        (bucket, dest_path) = self.parse_gcs_uri(self.artifact_uri)
+        dest_path = posixpath.join(dest_path, artifact_path) if artifact_path else dest_path
+
+        gcs_bucket = self._get_bucket(bucket)
+        # get_blob() (unlike blob(), which just builds a local handle with no
+        # network call) fetches the object's metadata, so it both confirms the
+        # object exists and gives us its size for the response.
+        blob = gcs_bucket.get_blob(dest_path)
+        if blob is None:
+            raise MlflowException(
+                f"No such file or directory: '{dest_path}'",
+                error_code=RESOURCE_DOES_NOT_EXIST,
+            )
+
+        # Serve the object as a download with the artifact's own filename, same
+        # rationale as S3ArtifactRepository.get_download_presigned_url.
+        url = blob.generate_signed_url(
+            method="GET",
+            version="v4",
+            expiration=datetime.timedelta(seconds=expiration),
+            response_disposition=_attachment_content_disposition(posixpath.basename(dest_path)),
+        )
+        return PresignedDownloadUrlResponse(url=url, headers={}, file_size=blob.size)
 
     @staticmethod
     def _validate_support_mpu():

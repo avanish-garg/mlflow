@@ -1,3 +1,4 @@
+import datetime
 import os
 import posixpath
 from unittest import mock
@@ -8,6 +9,7 @@ from google.auth.exceptions import DefaultCredentialsError
 from google.cloud.storage import client as gcs_client
 
 from mlflow.entities.multipart_upload import MultipartUploadPart
+from mlflow.exceptions import MlflowException
 from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 from mlflow.store.artifact.gcs_artifact_repo import GCSArtifactRepository, GCSMPUArguments
 
@@ -571,3 +573,71 @@ def test_retryable_log_artifacts(throw, tmp_path):
             gcs_refreshed_bucket_mock.blob.assert_not_called()
             mock_gcs_client_factory.assert_not_called()
             mock_gcs_credentials_factory.assert_not_called()
+
+
+def test_create_presigned_upload_url(mock_client):
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
+    mock_bucket = mock_client.bucket.return_value
+    mock_blob = mock_bucket.blob.return_value
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-put"
+
+    response = repo.create_presigned_upload_url("model.pkl")
+
+    mock_bucket.blob.assert_called_once_with("some/path/model.pkl")
+    mock_blob.generate_signed_url.assert_called_once()
+    _, kwargs = mock_blob.generate_signed_url.call_args
+    assert kwargs["method"] == "PUT"
+    # .pkl has no standard MIME type, so it should fall back to application/octet-stream
+    assert kwargs["content_type"] == "application/octet-stream"
+    assert response.presigned_url == "https://storage.googleapis.com/signed-put"
+    assert response.headers == {"Content-Type": "application/octet-stream"}
+
+
+def test_create_presigned_upload_url_with_known_content_type(mock_client):
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
+    mock_blob = mock_client.bucket.return_value.blob.return_value
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-put"
+
+    response = repo.create_presigned_upload_url("data.json")
+
+    _, kwargs = mock_blob.generate_signed_url.call_args
+    assert kwargs["content_type"] == "application/json"
+    assert response.headers["Content-Type"] == "application/json"
+
+
+def test_create_presigned_upload_url_custom_expiration(mock_client):
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
+    mock_blob = mock_client.bucket.return_value.blob.return_value
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-put"
+
+    repo.create_presigned_upload_url("model.pkl", expiration=60)
+
+    _, kwargs = mock_blob.generate_signed_url.call_args
+    assert kwargs["expiration"] == datetime.timedelta(seconds=60)
+
+
+def test_get_download_presigned_url(mock_client):
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
+    mock_bucket = mock_client.bucket.return_value
+    mock_blob = mock_bucket.get_blob.return_value
+    mock_blob.size = 123
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-get"
+
+    response = repo.get_download_presigned_url("model.pkl")
+
+    mock_bucket.get_blob.assert_called_once_with("some/path/model.pkl")
+    mock_blob.generate_signed_url.assert_called_once()
+    _, kwargs = mock_blob.generate_signed_url.call_args
+    assert kwargs["method"] == "GET"
+    assert 'filename="model.pkl"' in kwargs["response_disposition"]
+    assert response.url == "https://storage.googleapis.com/signed-get"
+    assert response.headers == {}
+    assert response.file_size == 123
+
+
+def test_get_download_presigned_url_missing_blob_raises(mock_client):
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
+    mock_client.bucket.return_value.get_blob.return_value = None
+
+    with pytest.raises(MlflowException, match="No such file or directory"):
+        repo.get_download_presigned_url("missing.pkl")

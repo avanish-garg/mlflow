@@ -5,20 +5,26 @@ import posixpath
 import re
 import urllib.parse
 from datetime import timezone
+from mimetypes import guess_type
 
 from mlflow.entities import FileInfo
 from mlflow.entities.multipart_upload import (
     CreateMultipartUploadResponse,
     MultipartUploadCredential,
 )
+from mlflow.entities.presigned_download import PresignedDownloadUrlResponse
+from mlflow.entities.presigned_upload import CreatePresignedUploadResponse
 from mlflow.environment_variables import MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT
 from mlflow.exceptions import MlflowException, _UnsupportedMultipartUploadException
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 from mlflow.store.artifact.artifact_repo import (
     ArtifactRepository,
+    MultipartDownloadMixin,
     MultipartUploadMixin,
+    PresignedUploadMixin,
     _is_object_key_within_path,
 )
+from mlflow.store.artifact.s3_artifact_repo import _attachment_content_disposition
 from mlflow.utils.credentials import get_default_host_creds
 
 
@@ -34,7 +40,9 @@ def decode_base64(encoded: str) -> str:
     return decoded_bytes.decode("utf-8")
 
 
-class AzureBlobArtifactRepository(ArtifactRepository, MultipartUploadMixin):
+class AzureBlobArtifactRepository(
+    ArtifactRepository, MultipartUploadMixin, MultipartDownloadMixin, PresignedUploadMixin
+):
     """
     Stores artifacts on Azure Blob Storage.
 
@@ -317,3 +325,96 @@ class AzureBlobArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         # See https://docs.microsoft.com/en-us/rest/api/storageservices/put-block-list#remarks
         # The blob may already exist so we cannot delete it either.
         pass
+
+    def _generate_sas_token(self, container, dest_path, permission, expiry, **kwargs):
+        """Generate a SAS token for a blob.
+
+        Uses an account key if available, otherwise a short-lived user
+        delegation key (same fallback ``create_multipart_upload`` uses).
+        """
+        from azure.core.exceptions import HttpResponseError
+        from azure.storage.blob import generate_blob_sas
+
+        now = datetime.datetime.now(timezone.utc)
+        sas_kwargs = {
+            "account_name": self.client.account_name,
+            "container_name": container,
+            "blob_name": dest_path,
+            "permission": permission,
+            "expiry": expiry,
+            **kwargs,
+        }
+        credential = self.client.credential
+        if account_key := getattr(credential, "account_key", None):
+            sas_kwargs["account_key"] = account_key
+        elif hasattr(credential, "get_token"):
+            start = now - datetime.timedelta(minutes=5)
+            try:
+                user_delegation_key = self.client.get_user_delegation_key(start, expiry)
+            except HttpResponseError as e:
+                if (
+                    e.status_code == 403
+                    and getattr(e, "error_code", None) == "AuthorizationPermissionMismatch"
+                ):
+                    raise _UnsupportedMultipartUploadException() from e
+                raise
+            sas_kwargs.update(user_delegation_key=user_delegation_key, start=start)
+        else:
+            raise _UnsupportedMultipartUploadException()
+
+        return generate_blob_sas(**sas_kwargs)
+
+    def create_presigned_upload_url(self, artifact_path, expiration=900):
+        """Generate a presigned URL for uploading an artifact directly to Azure Blob Storage."""
+        from azure.storage.blob import BlobSasPermissions
+
+        (container, _, dest_path, _) = self.parse_wasbs_uri(self.artifact_uri)
+        dest_path = posixpath.join(dest_path, artifact_path)
+
+        content_type, _ = guess_type(artifact_path)
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        expiry = datetime.datetime.now(timezone.utc) + datetime.timedelta(seconds=expiration)
+        sas_token = self._generate_sas_token(
+            container, dest_path, BlobSasPermissions(write=True), expiry
+        )
+        blob_url = posixpath.join(self.client.url, container, dest_path)
+
+        # A plain PUT to a not-yet-existing blob is ambiguous between Azure's
+        # blob types, so the client must send this header alongside the
+        # presigned PUT or the request is rejected.
+        return CreatePresignedUploadResponse(
+            presigned_url=f"{blob_url}?{sas_token}",
+            headers={"x-ms-blob-type": "BlockBlob", "Content-Type": content_type},
+        )
+
+    def get_download_presigned_url(self, artifact_path, expiration=300):
+        """Generate a presigned URL for downloading an artifact directly from Azure Blob Storage."""
+        from azure.core.exceptions import ResourceNotFoundError
+        from azure.storage.blob import BlobSasPermissions
+
+        (container, _, dest_path, _) = self.parse_wasbs_uri(self.artifact_uri)
+        dest_path = posixpath.join(dest_path, artifact_path) if artifact_path else dest_path
+
+        blob_client = self.client.get_blob_client(container, dest_path)
+        try:
+            properties = blob_client.get_blob_properties()
+        except ResourceNotFoundError as e:
+            raise MlflowException(
+                f"No such file or directory: '{dest_path}'",
+                error_code=RESOURCE_DOES_NOT_EXIST,
+            ) from e
+
+        expiry = datetime.datetime.now(timezone.utc) + datetime.timedelta(seconds=expiration)
+        # Serve the object as a download with the artifact's own filename, same
+        # rationale as S3ArtifactRepository.get_download_presigned_url.
+        sas_token = self._generate_sas_token(
+            container,
+            dest_path,
+            BlobSasPermissions(read=True),
+            expiry,
+            content_disposition=_attachment_content_disposition(posixpath.basename(dest_path)),
+        )
+        url = f"{blob_client.url}?{sas_token}"
+        return PresignedDownloadUrlResponse(url=url, headers={}, file_size=properties.size)
