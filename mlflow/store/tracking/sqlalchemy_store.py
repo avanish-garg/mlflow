@@ -1547,15 +1547,13 @@ class SqlAlchemyStore(
             return
 
         is_single_metric = len(metrics) == 1
-        seen: set[Metric] = set()
-        sanitized_metrics: list[tuple[Metric, float]] = []
+        # Drop in-batch duplicates by their stored columns rather than by `Metric` entity, since
+        # two NaN entities never compare equal and the duplicate would violate the primary key.
+        seen: set[tuple[Any, ...]] = set()
+        sanitized_metrics: list[tuple[Metric, float | None]] = []
         for idx, metric in enumerate(metrics):
             if metric.model_id is None:
                 continue
-
-            if metric in seen:
-                continue
-            seen.add(metric)
 
             _validate_metric(
                 metric.key,
@@ -1569,7 +1567,20 @@ class SqlAlchemyStore(
             # as NULL rather than the 0 that `sanitize_metric_value` substitutes for it.
             # Otherwise a NaN is read back as 0.0 and satisfies numeric filters such as
             # `metrics.loss < 0.1`.
-            sanitized_metrics.append((metric, None if is_nan else value))
+            stored_value = None if is_nan else value
+            identity = (
+                metric.model_id,
+                metric.key,
+                metric.timestamp,
+                metric.step,
+                stored_value,
+                metric.dataset_name,
+                metric.dataset_digest,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            sanitized_metrics.append((metric, stored_value))
 
         if not sanitized_metrics:
             return

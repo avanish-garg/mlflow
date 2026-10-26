@@ -13,7 +13,7 @@ import sqlalchemy
 from packaging.version import Version
 
 import mlflow
-from mlflow import entities
+from mlflow import MlflowClient, entities
 from mlflow.entities import (
     LoggedModelStatus,
     Metric,
@@ -4392,6 +4392,147 @@ def test_logged_model_nan_metric_can_be_logged_again_without_error(store: SqlAlc
     assert math.isnan(metrics["loss"])
     assert metrics["acc"] == 0.9
     assert len(store.get_logged_model(model.model_id).metrics) == 2
+
+
+def _create_run_and_logged_model(store: SqlAlchemyStore):
+    exp_id = store.create_experiment(f"exp-{uuid.uuid4()}")
+    run = store.create_run(
+        experiment_id=exp_id, user_id="user", start_time=0, run_name="run", tags=[]
+    )
+    model = store.create_logged_model(experiment_id=exp_id, name="model")
+    return exp_id, run, model
+
+
+def _stored_logged_model_metrics(store: SqlAlchemyStore, model_id: str):
+    return sorted(
+        ((m.key, m.timestamp, m.step, m.value) for m in store.get_logged_model(model_id).metrics),
+        key=lambda m: m[:3],
+    )
+
+
+def test_log_batch_ignores_duplicate_nan_logged_model_metrics_in_one_batch(
+    store: SqlAlchemyStore,
+):
+    # Every `float("nan")` is a distinct object and NaN != NaN, so two NaN `Metric` entities are
+    # never equal even though they are identical. Use a fresh object for each metric.
+    _, run, model = _create_run_and_logged_model(store)
+    metrics = [
+        Metric("loss", float("nan"), timestamp=100, step=0, model_id=model.model_id)
+        for _ in range(2)
+    ]
+    assert metrics[0] != metrics[1]
+    store.log_batch(run.info.run_id, metrics=metrics, params=[], tags=[])
+
+    ((key, timestamp, step, value),) = _stored_logged_model_metrics(store, model.model_id)
+    assert (key, timestamp, step) == ("loss", 100, 0)
+    assert math.isnan(value)
+
+
+def test_log_batch_ignores_duplicate_nan_logged_model_metrics_via_client(
+    store: SqlAlchemyStore,
+):
+    _, run, model = _create_run_and_logged_model(store)
+    metrics = [
+        Metric("loss", float("nan"), timestamp=100, step=0, model_id=model.model_id)
+        for _ in range(2)
+    ]
+    with mock.patch("mlflow.tracking._tracking_service.utils._get_store", return_value=store):
+        MlflowClient().log_batch(run.info.run_id, metrics=metrics)
+
+    ((_, _, _, value),) = _stored_logged_model_metrics(store, model.model_id)
+    assert math.isnan(value)
+
+
+def test_log_metric_twice_with_nan_logged_model_metric(store: SqlAlchemyStore):
+    _, run, model = _create_run_and_logged_model(store)
+    for _ in range(2):
+        store.log_metric(
+            run.info.run_id,
+            Metric("loss", float("nan"), timestamp=100, step=0, model_id=model.model_id),
+        )
+
+    ((_, _, _, value),) = _stored_logged_model_metrics(store, model.model_id)
+    assert math.isnan(value)
+
+
+def test_log_batch_ignores_duplicate_finite_logged_model_metrics_in_one_batch(
+    store: SqlAlchemyStore,
+):
+    _, run, model = _create_run_and_logged_model(store)
+    metrics = [
+        Metric("loss", 0.5, timestamp=100, step=0, model_id=model.model_id) for _ in range(2)
+    ]
+    store.log_batch(run.info.run_id, metrics=metrics, params=[], tags=[])
+
+    assert _stored_logged_model_metrics(store, model.model_id) == [("loss", 100, 0, 0.5)]
+
+
+def test_log_batch_mixed_duplicate_and_distinct_logged_model_metrics(store: SqlAlchemyStore):
+    _, run, model = _create_run_and_logged_model(store)
+    model_id = model.model_id
+    metrics = [
+        Metric("loss", float("nan"), timestamp=100, step=0, model_id=model_id),
+        Metric("loss", float("nan"), timestamp=100, step=0, model_id=model_id),
+        Metric("loss", float("nan"), timestamp=100, step=1, model_id=model_id),
+        Metric("loss", 0.5, timestamp=100, step=2, model_id=model_id),
+        Metric("loss", 0.5, timestamp=100, step=2, model_id=model_id),
+        Metric("acc", float("nan"), timestamp=100, step=0, model_id=model_id),
+        Metric("acc", 0.9, timestamp=100, step=1, model_id=model_id),
+    ]
+    store.log_batch(run.info.run_id, metrics=metrics, params=[], tags=[])
+
+    stored = {(k, t, s): v for k, t, s, v in _stored_logged_model_metrics(store, model_id)}
+    assert len(stored) == 5
+    assert math.isnan(stored["loss", 100, 0])
+    assert math.isnan(stored["loss", 100, 1])
+    assert stored["loss", 100, 2] == 0.5
+    assert math.isnan(stored["acc", 100, 0])
+    assert stored["acc", 100, 1] == 0.9
+
+    # Logging the same batch again is a no-op
+    store.log_batch(run.info.run_id, metrics=metrics, params=[], tags=[])
+    assert len(store.get_logged_model(model_id).metrics) == 5
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (0.5, 0.6),
+        (float("nan"), 0.0),
+        (0.0, float("nan")),
+        (float("nan"), 0.5),
+    ],
+)
+def test_log_batch_different_logged_model_metric_values_at_same_key_raise(
+    store: SqlAlchemyStore, first, second
+):
+    # The primary key of `logged_model_metrics` excludes the value, so two different values at
+    # the same (model, name, timestamp, step, run) conflict. A NaN is not special: it conflicts
+    # with 0.0 (what it used to be stored as) exactly like any other differing finite value.
+    _, run, model = _create_run_and_logged_model(store)
+    model_id = model.model_id
+    metrics = [
+        Metric("loss", first, timestamp=100, step=0, model_id=model_id),
+        Metric("loss", second, timestamp=100, step=0, model_id=model_id),
+    ]
+    with pytest.raises(MlflowException, match="IntegrityError"):
+        store.log_batch(run.info.run_id, metrics=metrics, params=[], tags=[])
+
+    # Across separate calls
+    _, run, model = _create_run_and_logged_model(store)
+    store.log_batch(
+        run.info.run_id,
+        metrics=[Metric("loss", first, timestamp=100, step=0, model_id=model.model_id)],
+        params=[],
+        tags=[],
+    )
+    with pytest.raises(MlflowException, match="IntegrityError"):
+        store.log_batch(
+            run.info.run_id,
+            metrics=[Metric("loss", second, timestamp=100, step=0, model_id=model.model_id)],
+            params=[],
+            tags=[],
+        )
 
 
 @pytest.mark.parametrize(
